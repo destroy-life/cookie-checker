@@ -1,4 +1,4 @@
-# amai-check
+# cookie-checker
 
 Validador multi-servicio de sesiones y cookies en tiempo real con exportación limpia para **Cookie-Editor**.
 

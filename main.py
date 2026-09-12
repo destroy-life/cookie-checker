@@ -12,6 +12,8 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
+import re
 import shutil
 import sys
 from collections import defaultdict
@@ -24,7 +26,16 @@ if str(ROOT) not in sys.path:
 
 from src.load import detect_service, discover_jars, requests_cookie_dict
 from src.models import CheckResult, finalize
-from src.progress import print_banner, print_result, print_skip, print_summary
+from src.progress import (
+    load_completed_sources,
+    load_seen_fingerprints,
+    print_banner,
+    print_result,
+    print_skip,
+    print_summary,
+    prune_progress_for_services,
+    summarize_progress,
+)
 from src.services import ALL_SERVICES, REGISTRY, SERVICE_FOLDER
 from src.write import (
     is_real_email,
@@ -32,6 +43,7 @@ from src.write import (
     label_from_jar,
     safe_stem,
     save_cookie_editor_json,
+    to_cookie_editor,
     uniquify_label,
 )
 
@@ -71,6 +83,69 @@ def _jar_fingerprint(jar) -> str:
                 parts.append(f"{c.name}|{c.domain or ''}|{(c.value or '')[:80]}")
     blob = "\n".join(parts) or (str(jar.source) if jar.source else "empty")
     return hashlib.sha1(blob.encode("utf-8", errors="replace")).hexdigest()
+
+
+def _sync_progress(progress) -> None:
+    """Flush one progress row all the way to disk when possible."""
+    progress.flush()
+    try:
+        os.fsync(progress.fileno())
+    except OSError:
+        pass
+
+
+def _seed_serial_counters(services: set[str]) -> dict[str, int]:
+    """Continue Alive#/Dead#/Maybe# labels cleanly after a resumed run."""
+    counters: dict[str, int] = {}
+    pattern = re.compile(r"^(Alive|Dead|Maybe)#(\d+)(?:_|$)", re.I)
+    for service in services:
+        folder = SERVICE_FOLDER.get(service, service.capitalize())
+        for bucket in ("valid", "invalid", "unknown"):
+            base = OUTPUT / bucket / folder
+            if not base.exists():
+                continue
+            for path in base.rglob("*.json"):
+                m = pattern.match(path.stem)
+                if not m:
+                    continue
+                prefix = m.group(1).capitalize()
+                key = f"{service}:{prefix}"
+                counters[key] = max(counters.get(key, 0), int(m.group(2)))
+    return counters
+
+
+def _payload_digest(payload) -> str:
+    raw = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+    return hashlib.sha256(raw.encode("utf-8", errors="replace")).hexdigest()
+
+
+def _build_output_index() -> dict[tuple[str, str], Path]:
+    """Index existing Cookie-Editor exports so a crash cannot create _2/_3 copies."""
+    out: dict[tuple[str, str], Path] = {}
+    for bucket in ("valid", "invalid", "unknown"):
+        base = OUTPUT / bucket
+        if not base.exists():
+            continue
+        for path in base.rglob("*.json"):
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                digest = _payload_digest(payload)
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                continue
+            parent = os.path.normcase(os.path.abspath(str(path.parent)))
+            out[(parent, digest)] = path
+    return out
+
+
+def _jar_output_key(dest_dir: Path, jar) -> tuple[str, str]:
+    parent = os.path.normcase(os.path.abspath(str(dest_dir)))
+    return parent, _payload_digest(to_cookie_editor(jar))
 
 
 def _clean_services(services: set[str]) -> None:
@@ -201,6 +276,11 @@ def main(argv: list[str] | None = None) -> int:
         help="comma list: chatgpt,spotify,grok,claude,cursor,twitter|x,netflix,crunchyroll,roblox",
     )
     parser.add_argument("--timeout", type=int, default=25)
+    parser.add_argument(
+        "--reset",
+        action="store_true",
+        help="ignore saved resume state without deleting existing output",
+    )
     args = parser.parse_args(argv)
     only = _parse_services(args.services)
 
@@ -243,23 +323,38 @@ def main(argv: list[str] | None = None) -> int:
     services_in_run = {s for _, s in resolved if s != "unknown"}
     if only:
         services_in_run |= only
+
+    progress_path = OUTPUT / "reports" / "progress.jsonl"
     if args.clean and services_in_run:
         _clean_services(services_in_run)
+        prune_progress_for_services(progress_path, services_in_run)
 
     bid, stamp = print_banner(ROOT, len(jars), only)
     counts: dict[str, int] = defaultdict(int)
-    valid_by_plan: dict[str, int] = defaultdict(int)
     used_labels: dict[str, set[str]] = defaultdict(set)
-    alive_counters: dict[str, int] = {}
-    seen_fps: set[str] = set()
-    progress_path = OUTPUT / "reports" / "progress.jsonl"
+    alive_counters = _seed_serial_counters(services_in_run)
+    output_index = _build_output_index()
+
+    if args.reset or args.clean:
+        already_done: set[str] = set()
+        seen_fps: set[str] = set()
+    else:
+        already_done = load_completed_sources(progress_path)
+        seen_fps = load_seen_fingerprints(progress_path)
+        if already_done:
+            print(f"[RESUME] {len(already_done)} completed source(s) will be skipped", flush=True)
 
     with progress_path.open("a", encoding="utf-8") as progress:
         # LIVE per-file loop: check → atomic write → print (amai style)
         for jar, service in resolved:
             src_name = jar.source.name if jar.source else "?"
-            fp = _jar_fingerprint(jar)
-            if fp in seen_fps:
+            src_key = os.path.normcase(os.path.abspath(str(jar.source))) if jar.source else ""
+            if src_key and src_key in already_done:
+                counts["skipped_resume"] += 1
+                continue
+
+            fp_key = _jar_fingerprint(jar)[:16]
+            if fp_key in seen_fps:
                 counts["skipped_dup"] += 1
                 print_skip(service, src_name, "duplicate jar (same session cookies)")
                 progress.write(
@@ -267,12 +362,14 @@ def main(argv: list[str] | None = None) -> int:
                         "ts": stamp, "build": bid,
                         "source": str(jar.source) if jar.source else "",
                         "service": service, "status": "skipped_dup",
-                        "reason": "duplicate jar fingerprint", "fp": fp[:16],
+                        "reason": "duplicate jar fingerprint", "fp": fp_key,
                     }, ensure_ascii=False) + "\n"
                 )
-                progress.flush()
+                _sync_progress(progress)
+                if src_key:
+                    already_done.add(src_key)
                 continue
-            seen_fps.add(fp)
+            seen_fps.add(fp_key)
 
             result = _run_check(jar, service, args.timeout)
             bucket = (result.category or ("valid" if result.valid else "invalid")).lower()
@@ -295,49 +392,55 @@ def main(argv: list[str] | None = None) -> int:
             digest = jar_digest(jar, str(jar.source or "jar"))
             dest_key = str(dest_dir)
             label_set = used_labels[dest_key]
-            candidate = uniquify_label(dest_dir, label, digest, label_set, need_cookie=True)
-            if candidate is None:
-                counts["skipped_write"] += 1
-                print(f"[WARN] could not uniquify label for {src_name}; skip write", flush=True)
-                progress.write(
-                    json.dumps({
-                        "ts": stamp, "build": bid, "source": str(jar.source or ""),
-                        "service": service, "status": "skipped_write",
-                        "reason": "could not uniquify label",
-                    }, ensure_ascii=False) + "\n"
-                )
-                progress.flush()
-                continue
 
-            # packaging only: Cookie-Editor {label}.json (no sibling .result.json)
-            out_cookie = dest_dir / f"{candidate}.json"
-            owned: list[Path] = []
-            try:
-                save_cookie_editor_json(jar, out_cookie)
-                owned.append(out_cookie)
-            except (FileExistsError, OSError, ValueError) as exc:
-                for p in owned:
-                    try:
-                        p.unlink(missing_ok=True)
-                    except OSError:
-                        pass
-                reason = "export exists" if isinstance(exc, FileExistsError) else f"write failed: {type(exc).__name__}"
-                print(f"[WARN] {reason} for {candidate}; skip write", flush=True)
-                counts["skipped_write"] += 1
-                progress.write(
-                    json.dumps({
-                        "ts": stamp, "build": bid, "source": str(jar.source or ""),
-                        "service": service, "status": "skipped_write", "reason": reason,
-                        "label": candidate,
-                    }, ensure_ascii=False) + "\n"
-                )
-                progress.flush()
-                continue
+            export_key = _jar_output_key(dest_dir, jar)
+            existing = output_index.get(export_key)
+            if existing is not None and existing.is_file():
+                out_cookie = existing
+                candidate = existing.stem
+            else:
+                candidate = uniquify_label(dest_dir, label, digest, label_set, need_cookie=True)
+                if candidate is None:
+                    counts["skipped_write"] += 1
+                    print(f"[WARN] could not uniquify label for {src_name}; skip write", flush=True)
+                    progress.write(
+                        json.dumps({
+                            "ts": stamp, "build": bid, "source": str(jar.source or ""),
+                            "service": service, "status": "skipped_write",
+                            "reason": "could not uniquify label", "fp": fp_key,
+                        }, ensure_ascii=False) + "\n"
+                    )
+                    _sync_progress(progress)
+                    continue
+
+                # packaging only: Cookie-Editor {label}.json (no sibling .result.json)
+                out_cookie = dest_dir / f"{candidate}.json"
+                owned: list[Path] = []
+                try:
+                    save_cookie_editor_json(jar, out_cookie)
+                    owned.append(out_cookie)
+                    output_index[export_key] = out_cookie
+                except (FileExistsError, OSError, ValueError) as exc:
+                    for p in owned:
+                        try:
+                            p.unlink(missing_ok=True)
+                        except OSError:
+                            pass
+                    reason = "export exists" if isinstance(exc, FileExistsError) else f"write failed: {type(exc).__name__}"
+                    print(f"[WARN] {reason} for {candidate}; skip write", flush=True)
+                    counts["skipped_write"] += 1
+                    progress.write(
+                        json.dumps({
+                            "ts": stamp, "build": bid, "source": str(jar.source or ""),
+                            "service": service, "status": "skipped_write", "reason": reason,
+                            "label": candidate, "fp": fp_key,
+                        }, ensure_ascii=False) + "\n"
+                    )
+                    _sync_progress(progress)
+                    continue
 
             label_set.add(candidate.lower())
             counts[bucket] += 1
-            if bucket == "valid":
-                valid_by_plan[f"{service}:{result.plan_live or plan_path}"] += 1
 
             # PRINT IMMEDIATELY (amai live loop) — never buffer all then dump
             print_result(result, label=candidate, out_path=out_cookie)
@@ -348,10 +451,16 @@ def main(argv: list[str] | None = None) -> int:
                     "service": service, "status": bucket,
                     "reason": result.reason, "plan_live": result.plan_live,
                     "email": result.email, "label": candidate,
-                    "output": str(out_cookie.relative_to(OUTPUT)),
+                    "output": str(out_cookie.relative_to(OUTPUT)), "fp": fp_key,
                 }, ensure_ascii=False) + "\n"
             )
-            progress.flush()
+            _sync_progress(progress)
+            if src_key and bucket in ("valid", "invalid"):
+                already_done.add(src_key)
+
+    batch_sources = [jar.source for jar, _ in resolved if jar.source is not None]
+    total_counts, valid_by_plan = summarize_progress(progress_path, batch_sources)
+    total_counts["skipped_resume"] = counts.get("skipped_resume", 0)
 
     summary_path = OUTPUT / "reports" / "summary.txt"
     summary = [
@@ -359,11 +468,12 @@ def main(argv: list[str] | None = None) -> int:
         f"run: {stamp}",
         f"build: {bid}",
         f"files: {len(jars)}",
-        f"valid: {counts['valid']}",
-        f"invalid: {counts['invalid']}",
-        f"unknown: {counts['unknown']}",
-        f"skipped_dup: {counts.get('skipped_dup', 0)}",
-        f"skipped_write: {counts.get('skipped_write', 0)}",
+        f"valid: {total_counts['valid']}",
+        f"invalid: {total_counts['invalid']}",
+        f"unknown: {total_counts['unknown']}",
+        f"skipped_dup: {total_counts.get('skipped_dup', 0)}",
+        f"skipped_write: {total_counts.get('skipped_write', 0)}",
+        f"skipped_resume: {counts.get('skipped_resume', 0)}",
         "",
         "valid by service (plan_live):",
     ]
@@ -373,7 +483,9 @@ def main(argv: list[str] | None = None) -> int:
     else:
         summary.append("  (none)")
     summary_path.write_text("\n".join(summary) + "\n", encoding="utf-8")
-    print_summary(counts, valid_by_plan)
+    print_summary(total_counts, valid_by_plan)
+    if counts.get("skipped_resume", 0):
+        print(f"skipped_resume={counts['skipped_resume']}", flush=True)
     print(f"reports: {summary_path}", flush=True)
 
     # Limpieza final: borra carpetas en output que hayan quedado completamente vacías
@@ -389,4 +501,9 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        print("\n[!] Ejecucion interrumpida por el usuario.", flush=True)
+        print("[*] El progreso guardado se conservara para la proxima ejecucion.", flush=True)
+        raise SystemExit(130)
